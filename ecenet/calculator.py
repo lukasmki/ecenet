@@ -83,6 +83,18 @@ class ECENetCalculator(Calculator):
     # ── Construction helpers ────────────────────────────────────────────────
 
     @classmethod
+    def _build_model(cls, hp, n_mp, ckpt):
+        """Instantiate the architecture described by ``hparams``.
+
+        The seam subclasses override to rebuild something other than a plain
+        ECENet; everything around it (dtype, device, state-dict validation,
+        element mapping, units) is architecture-agnostic and stays in
+        ``from_checkpoint``.
+        """
+        from ecenet import ECENet
+        return ECENet(**hp, n_mp=n_mp)
+
+    @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
                         energy_reference=None, element_to_type=None,
                         energy_units=None, log_timings=False,
@@ -113,7 +125,6 @@ class ECENetCalculator(Calculator):
             'eV' or 'kcal/mol'. If None, read from the checkpoint's
             'energy_units' key, defaulting to 'eV'.
         """
-        from ecenet import ECENet
 
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -189,7 +200,7 @@ class ECENetCalculator(Calculator):
         state = {k: v for k, v in state.items()
                  if not (k.endswith('.pre_scale') or k.endswith('.pre_shift'))}
 
-        model = ECENet(**hp, n_mp=n_mp)
+        model = cls._build_model(hp, n_mp, ckpt)
         if dtype == torch.float64:
             model = model.double()
         model = model.to(device)
@@ -557,6 +568,144 @@ class ECENetLESCalculator(ECENetCalculator):
                                       **self.les_flags).sum()
 
 
+class MultiECENetCalculator(ECENetCalculator):
+    """ASE calculator for MultiECENet (EVB) checkpoints.
+
+    The extra ingredient over the base calculator is the *sector*: a
+    MultiECENet mixes only the diabats matching a structure's total charge (and
+    multiplicity), so the calculator has to tell it which one. Both are read
+    per-structure from ``atoms.info``::
+
+        atoms.info['charge'] = -1        # total charge; also accepts 'total_charge', 'q'
+        atoms.info['spin']   = 1         # multiplicity; also accepts 'multiplicity'
+
+    A missing charge falls back to ``default_charge`` (0 unless you say
+    otherwise) — set ``require_charge=True`` to make the omission an error
+    instead, which is what you want when running a model trained across several
+    charge sectors and a silent default would quietly give you the wrong state.
+
+    ``state_weights`` on the last evaluated frame is exposed through
+    ``self.results['state_weights']`` for trajectory analysis.
+    """
+
+    implemented_properties = ['energy', 'forces', 'stress', 'state_weights']
+
+    _CHARGE_KEYS = ('charge', 'total_charge', 'q')
+    _SPIN_KEYS = ('spin', 'multiplicity', 'spin_multiplicity')
+
+    def __init__(self, model, default_charge=0, default_spin=None,
+                 require_charge=False, sector_energy_reference=None, **kwargs):
+        super().__init__(model, **kwargs)
+        self.default_charge = default_charge
+        self.default_spin = default_spin
+        self.require_charge = require_charge
+        # {(charge, multiplicity): eV} — the per-sector intercept the trainer
+        # fitted alongside the per-element reference. Both were subtracted from
+        # the training targets, so both must be added back here; omitting this
+        # one leaves every ion off by electron-volts while neutrals look fine.
+        self.sector_energy_reference = dict(sector_energy_reference or {})
+        self._charge = default_charge
+        self._spin = default_spin
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, default_charge=0,
+                        default_spin=None, require_charge=False,
+                        sector_energy_reference=None, ckpt=None, **kwargs):
+        """Load an EVB checkpoint (see base class), plus the sector metadata."""
+        if ckpt is None:
+            ckpt = torch.load(checkpoint_path, map_location='cpu',
+                              weights_only=False)
+        calc = super().from_checkpoint(checkpoint_path, ckpt=ckpt, **kwargs)
+        calc.default_charge = default_charge
+        calc.default_spin = default_spin
+        calc.require_charge = require_charge
+        if sector_energy_reference is None:
+            # Stored as [charge, multiplicity, eV] triples by the trainer.
+            sector_energy_reference = {
+                (int(q), int(m)): float(v)
+                for q, m, v in ckpt.get('sector_energy_reference', [])}
+        calc.sector_energy_reference = dict(sector_energy_reference)
+        return calc
+
+    @classmethod
+    def _build_model(cls, hp, n_mp, ckpt):
+        from ecenet import MultiECENet
+        evb = ckpt.get('evb')
+        if evb is None:
+            raise ValueError(
+                "Checkpoint carries no 'evb' dict (states / shared_trunk / "
+                "mix_mode) — it is a plain ECENet; use ECENetCalculator.")
+        return MultiECENet(
+            states=[tuple(s) for s in evb['states']],
+            shared_trunk=evb.get('shared_trunk', True),
+            mix_mode=evb.get('mix_mode', 'eigvalsh'),
+            n_mp=n_mp, **hp)
+
+    # ── Sector plumbing ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _lookup(info, keys):
+        for k in keys:
+            if k in info:
+                return int(round(float(info[k])))
+        return None
+
+    def calculate(self, atoms=None, properties=('energy', 'forces'),
+                  system_changes=None):
+        """Read the sector off ``atoms.info``, then run the base calculation.
+
+        The energy seams below have no access to ``atoms``, so the sector is
+        resolved here, once, and stashed for them.
+        """
+        charge = self._lookup(atoms.info, self._CHARGE_KEYS)
+        if charge is None:
+            if self.require_charge:
+                raise ValueError(
+                    f"atoms.info carries no total charge (looked for "
+                    f"{self._CHARGE_KEYS}) and require_charge=True. This model "
+                    f"spans sectors {sorted(self.model.sectors)}; guessing one "
+                    f"would silently give the wrong state.")
+            charge = self.default_charge
+        spin = self._lookup(atoms.info, self._SPIN_KEYS)
+        self._charge = charge
+        self._spin = self.default_spin if spin is None else spin
+
+        from ase.calculators.calculator import all_changes
+        super().calculate(atoms, properties,
+                          all_changes if system_changes is None else system_changes)
+
+        # Add back the sector intercept the trainer subtracted (the base class
+        # already added the per-element reference).
+        key = (self._charge, 1 if self._spin is None else self._spin)
+        if self.sector_energy_reference:
+            if key not in self.sector_energy_reference:
+                raise ValueError(
+                    f"no sector energy reference for {key}; checkpoint carries "
+                    f"{sorted(self.sector_energy_reference)}")
+            self.results['energy'] += self.sector_energy_reference[key]
+
+        with torch.no_grad():
+            pos = torch.tensor(atoms.get_positions(), dtype=self.dtype,
+                               device=self.device)
+            types = torch.tensor(
+                [self.element_to_type[s] for s in atoms.get_chemical_symbols()],
+                dtype=torch.long, device=self.device)
+            w = self.model.state_weights(pos, types, charge=self._charge,
+                                         spin=self._spin)
+        self.results['state_weights'] = w.cpu().numpy()
+
+    def _energy_free(self, pos, types):
+        return self.model.forward(pos, types, charge=self._charge, spin=self._spin)
+
+    def _energy_pbc(self, pos, types, edge_i, edge_j, shift_vecs_edge,
+                    nb_src, nb_dst, shift_vecs_nb, cell=None):
+        return self.model.forward_pbc(
+            pos, types, edge_i, edge_j, shift_vecs_edge,
+            nb_src, nb_dst, shift_vecs_nb,
+            charge=self._charge, spin=self._spin)
+
+
+
 def load_calculator(checkpoint_path, verbose=True, **kwargs):
     """Load the right calculator for a checkpoint, whatever it was trained with.
 
@@ -569,8 +718,18 @@ def load_calculator(checkpoint_path, verbose=True, **kwargs):
     """
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     use_les = 'les' in ckpt
+    use_evb = 'evb' in ckpt
+    if use_les and use_evb:
+        raise ValueError("Checkpoint carries both 'les' and 'evb'; joint "
+                         "LES + EVB loading is not implemented.")
     if verbose and use_les:
         print("[les] joint-LES checkpoint — using ECENetLESCalculator "
               "(E_sr + E_lr)")
-    cls = ECENetLESCalculator if use_les else ECENetCalculator
+    if verbose and use_evb:
+        states = [tuple(s) for s in ckpt['evb']['states']]
+        print(f"[evb] MultiECENet checkpoint — using MultiECENetCalculator; "
+              f"sectors (charge, mult): {sorted(set(states))}. Set "
+              f"atoms.info['charge'] per structure.")
+    cls = (ECENetLESCalculator if use_les
+           else MultiECENetCalculator if use_evb else ECENetCalculator)
     return cls.from_checkpoint(checkpoint_path, ckpt=ckpt, **kwargs)

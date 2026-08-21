@@ -30,6 +30,7 @@ Pipeline:
 
 import functools
 import warnings
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -534,20 +535,57 @@ class ECENet(nn.Module):
         """Extract m=0 invariants: (n_edges, n_features_per_m, n_angular) → (n_edges, n_features_per_m)."""
         return A_cos[:, :, 0]
 
-    def _apply_output(self, invariants, dist_ij):
+    def _apply_output(self, invariants, dist_ij, net=None):
         """output_net(inv) → per-edge energies.
 
         n_max_d=None: the readout emits a single number per edge, multiplied by
         the cutoff envelope f(r) so the per-edge energy still decays smoothly to
         0 at r_cut_edge (continuous energy/forces) without an explicit radial
         basis — i.e. energy_edge = MLP(inv) · f(r_ij). The n_max_d>=1 path
-        instead dots the MLP output with the (cutoff-enveloped) radial basis."""
+        instead dots the MLP output with the (cutoff-enveloped) radial basis.
+
+        `net` swaps in a different readout head (same output width) in place of
+        self.output_net — MultiECENet hangs one head per EVB matrix element off
+        a shared trunk this way, so every head inherits the identical radial /
+        envelope treatment instead of respelling it."""
+        if self._capture is not None:
+            self._capture['invariants'] = invariants
+            self._capture['dist_ij'] = dist_ij
+        net = net if net is not None else self.output_net
         if self.n_max_d is not None:
             rij_basis = radial_basis(dist_ij, self.r_cut_edge, self.n_max_d,
                                      cutoff_type=self.cutoff_type)
-            return (self.output_net(invariants) * rij_basis).sum(-1)
+            return (net(invariants) * rij_basis).sum(-1)
         env = get_cutoff_fn(self.cutoff_type)(dist_ij, self.r_cut_edge)   # (n_e,) smooth → 0 at r_cut
-        return self.output_net(invariants).squeeze(-1) * env
+        return net(invariants).squeeze(-1) * env
+
+    # ── Trunk capture (MultiECENet) ─────────────────────────────────────────
+    # Every forward path funnels its per-edge invariants through _apply_output,
+    # which is why the capture hook lives there: one interception point covers
+    # forward / forward_pbc / forward_batch_multi / forward_batch, PBC shifts,
+    # FiLM, message passing and the fused kernels alike, with no duplication of
+    # the pipeline. MultiECENet runs the trunk once inside capture_edges(),
+    # throws the trunk's own energy away, and attaches its EVB heads to the
+    # captured invariants. Cost of the discarded readout is one MLP over the
+    # edges — negligible beside the equivariant stack that produced them.
+    _capture = None
+
+    @contextmanager
+    def capture_edges(self):
+        """Capture this trunk's per-edge readout inputs for the duration of one
+        forward call.
+
+        Yields a dict that the forward fills in with 'invariants' (n_e, F) and
+        'dist_ij' (n_e,), plus the batch paths' reduction metadata: 'struct_idx'
+        / 'n_struct' (forward_batch_multi) or 'n_struct' / 'n_edges_per_struct'
+        (forward_batch). A structure with no edges never reaches _apply_output,
+        so the dict stays empty — callers must treat that as the zero-edge case.
+        """
+        prev, self._capture = self._capture, {}
+        try:
+            yield self._capture
+        finally:
+            self._capture = prev
 
 
     def _run_equivariant_layers(self, A_cos, A_sin, **kwargs):
@@ -1113,6 +1151,9 @@ class ECENet(nn.Module):
 
         invariants = self._contract(A_cos, A_sin)
         per_edge_energy = self._apply_output(invariants, dist_ij)
+        if self._capture is not None:      # how to reduce edges → structures
+            self._capture['struct_idx'] = struct_idx
+            self._capture['n_struct'] = B
 
         energies = energies + torch.zeros(B, dtype=dtype, device=device).scatter_add(
             0, struct_idx, per_edge_energy)
@@ -1239,6 +1280,9 @@ class ECENet(nn.Module):
         # ── Step 6+7: m=0 invariants → output_net → dot(rij_basis) ──────────
         invariants = self._contract(A_cos_flat, A_sin_flat)      # (B*n_edges, n_features_per_m)
         per_edge_energy = self._apply_output(invariants, dist_ij.reshape(B * n_edges))  # (B*n_edges,)
+        if self._capture is not None:      # edges are (B, n_edges)-contiguous here
+            self._capture['n_struct'] = B
+            self._capture['n_edges_per_struct'] = n_edges
         energies = per_edge_energy.reshape(B, n_edges).sum(dim=1)        # (B,)
         energies = energies + self.atomic_energy[types].sum()
 
