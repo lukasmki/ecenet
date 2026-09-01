@@ -58,6 +58,7 @@ from train_ecenet_mptrj import (
 )
 
 from ecenet import ECENet, elements
+from ecenet.moe import diversity_loss
 
 # ---------------------------------------------------------------------------
 # Structures → on-device tensor dicts (with topology and cell)
@@ -126,6 +127,17 @@ def train_ecenet_xyz(
     les_charge_scale=1.0,    # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,        # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,        # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
+    # Mixture of experts (n_experts=1 → the plain single-head read-out; ecenet/moe.py)
+    n_experts=1,                  # K expert (diabatic) heads over the shared trunk
+    moe_mixture='evb',            # 'evb' | 'moe' | 'softmin' | 'mean'
+    moe_scope='atom',             # 'atom' (size-consistent) | 'global' (whole structure)
+    moe_coupling='mlp',           # 'mlp' | 'const' | 'none' (C ≡ 0 → hard min over experts)
+    moe_coupling_topology='full', # 'full' | 'chain' | 'none' — which expert pairs couple
+    moe_coupling_init=0.05,       # initial per-(type, pair) atomic coupling, eV/atom
+    moe_coupling_positive=False,  # softplus the assembled coupling so C > 0
+    moe_expert_init=0.05,         # std of the per-(type, expert) baseline (breaks expert symmetry)
+    moe_tau=0.1,                  # softmin temperature, eV/atom
+    moe_gap_eps=1e-12,            # radicand floor in the K=2 closed-form eigenvalue
     # Geometry
     r_cut_edge=5.0,
     r_cut_neighbor=4.0,
@@ -157,6 +169,20 @@ def train_ecenet_xyz(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
+    # Total-charge / total-spin conditioning (ecenet/electronic.py). Off by
+    # default; the model is then a pure function of geometry and composition.
+    # NOTE: this trainer does not yet read a per-structure charge/spin out of
+    # its dataset, so a run with charge_spin=True trains the state heads on the
+    # neutral, closed-shell state alone (Q = S = 0 for every frame). The flags
+    # are here so a charge-aware architecture round-trips through a checkpoint;
+    # feeding real states in is the next step.
+    charge_spin=False,
+    charge_spin_film=True,      # FiLM gate on the edge features (identity at init)
+    charge_spin_atomic=True,    # per-atom state-conditioned energy (zero at init)
+    charge_spin_embed_dim=16,
+    charge_spin_hidden=None,
+    charge_spin_per_m=False,    # per-(channel, m) gate, as film_per_m
+    charge_spin_shift=True,     # gate also emits the m=0 shift, as film_shift
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,
@@ -174,6 +200,11 @@ def train_ecenet_xyz(
     energy_weight=1.0,
     force_weight=1.0,
     stress_weight=0.0,
+    # Expert-collapse regulariser (n_experts > 1 only; not an architecture
+    # hparam, so it stays out of the checkpoint's `hparams`)
+    moe_diversity_weight=0.0,   # weight of the diversity term in the loss
+    moe_diversity_kind='load',  # 'load' | 'entropy' | 'cv' — see ecenet/moe.py
+    moe_freeze_experts=False,   # stage 2: train ONLY the couplings (see below)
     stress_conv=1.0,          # ASE info['stress'] is already eV/Å³
     loss='mse',
     loss_type=None,           # alias for `loss` (train_ecenet.py's name); wins if set
@@ -201,6 +232,13 @@ def train_ecenet_xyz(
     if best_metric not in ('force', 'energy', 'weighted'):
         raise ValueError("best_metric must be 'force', 'energy' or 'weighted', "
                          f"got {best_metric!r}")
+    use_moe = n_experts > 1
+    if moe_diversity_weight and not use_moe:
+        raise ValueError("moe_diversity_weight > 0 needs n_experts > 1 — there "
+                         "is nothing to balance with a single read-out head.")
+    if moe_freeze_experts and not use_moe:
+        raise ValueError("moe_freeze_experts needs n_experts > 1 — a single-head "
+                         "model has no couplings left to train once it is frozen.")
 
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -286,10 +324,27 @@ def train_ecenet_xyz(
         element_film=element_film, film_embed_dim=film_embed_dim,
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
+        charge_spin=charge_spin,
+        charge_spin_film=charge_spin_film,
+        charge_spin_atomic=charge_spin_atomic,
+        charge_spin_embed_dim=charge_spin_embed_dim,
+        charge_spin_hidden=charge_spin_hidden,
+        charge_spin_per_m=charge_spin_per_m,
+        charge_spin_shift=charge_spin_shift,
         les_readout=les_readout,
         les_charge_scale=les_charge_scale,
         les_dipole=les_dipole,
         les_charges=les_charges,
+        n_experts=n_experts,
+        moe_mixture=moe_mixture,
+        moe_scope=moe_scope,
+        moe_coupling=moe_coupling,
+        moe_coupling_topology=moe_coupling_topology,
+        moe_coupling_init=moe_coupling_init,
+        moe_coupling_positive=moe_coupling_positive,
+        moe_expert_init=moe_expert_init,
+        moe_tau=moe_tau,
+        moe_gap_eps=moe_gap_eps,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -312,15 +367,29 @@ def train_ecenet_xyz(
             les_module(l0, d0['pos'], cell=d0['cell'], **model.les_flags)
         les_module = les_module.to(device=device, dtype=dtype)
 
-    params = list(model.parameters())
+    # Two-stage schedule: with the experts already specialised (stage 1 — a run
+    # per chemical regime, or a joint run restored from `checkpoint_path`),
+    # freezing everything but the couplings fits C_ij against a *fixed* diabatic
+    # basis, which is what makes the second stage well posed rather than a
+    # re-parameterisation of the same surface.
+    if moe_freeze_experts:
+        if not model.mixture_head.n_pairs:
+            raise ValueError("moe_freeze_experts leaves nothing trainable: this "
+                             "model has no couplings (moe_coupling='none' or "
+                             "moe_coupling_topology='none').")
+        for name, prm in model.named_parameters():
+            prm.requires_grad_(name.startswith('mixture_head.coupling'))
+
+    params = [p for p in model.parameters() if p.requires_grad]
     if les_module is not None:
-        params += list(les_module.parameters())
-    n_params = sum(p.numel() for p in params if p.requires_grad)
+        params += [p for p in les_module.parameters() if p.requires_grad]
+    n_params = sum(p.numel() for p in params)
     if verbose:
         print_flush(f"\nECENet: {n_layers} layers, l_max={l_max}, n_max={n_max}, "
                     f"embed_dim={embed_dim}, n_types={n_types}")
         print_flush(f"  Trainable parameters: {n_params:,}"
-                    + (" (incl. LES charge head)" if use_les else ""))
+                    + (" (incl. LES charge head)" if use_les else "")
+                    + (" — couplings only, experts frozen" if moe_freeze_experts else ""))
 
     # ── Optimiser / LR schedule (same semantics as the other trainers) ────
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
@@ -410,10 +479,27 @@ def train_ecenet_xyz(
                 element_film=element_film, film_embed_dim=film_embed_dim,
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
+                charge_spin=charge_spin,
+                charge_spin_film=charge_spin_film,
+                charge_spin_atomic=charge_spin_atomic,
+                charge_spin_embed_dim=charge_spin_embed_dim,
+                charge_spin_hidden=charge_spin_hidden,
+                charge_spin_per_m=charge_spin_per_m,
+                charge_spin_shift=charge_spin_shift,
                 les_readout=les_readout,
                 les_charge_scale=les_charge_scale,
                 les_dipole=les_dipole,
                 les_charges=les_charges,
+                n_experts=n_experts,
+                moe_mixture=moe_mixture,
+                moe_scope=moe_scope,
+                moe_coupling=moe_coupling,
+                moe_coupling_topology=moe_coupling_topology,
+                moe_coupling_init=moe_coupling_init,
+                moe_coupling_positive=moe_coupling_positive,
+                moe_expert_init=moe_expert_init,
+                moe_tau=moe_tau,
+                moe_gap_eps=moe_gap_eps,
             ),
             'element_to_type': elements.to_element_to_type(type_map),
             'e_ref': e_ref,
@@ -447,6 +533,7 @@ def train_ecenet_xyz(
         long-range term too.
         """
         energies = []
+        mix_weights = []
         pos_leaf, strain_leaf = [], []
         for d in batch:
             p = d['pos'].detach().clone().requires_grad_(True)
@@ -464,18 +551,21 @@ def train_ecenet_xyz(
             else:
                 pos_in, shift_e_in, shift_nb_in = p, d['shift_e'], d['shift_nb']
 
+            out = model.forward_pbc(
+                pos_in, d['types'], d['edge_i'], d['edge_j'], shift_e_in,
+                d['nb_src'], d['nb_dst'], shift_nb_in,
+                return_embeddings=use_les, l0_only=use_les,
+                return_mixture=use_moe)
+            if use_moe:
+                *out, info = out
+                mix_weights.append(info['weights'])
+                out = out[0] if len(out) == 1 else tuple(out)
             if use_les:
-                e_sr, l0 = model.forward_pbc(
-                    pos_in, d['types'], d['edge_i'], d['edge_j'], shift_e_in,
-                    d['nb_src'], d['nb_dst'], shift_nb_in,
-                    return_embeddings=True, l0_only=True)
-                e_lr = les_module(l0, pos_in, cell=cell_in,
-                                  **model.les_flags)
+                e_sr, l0 = out
+                e_lr = les_module(l0, pos_in, cell=cell_in, **model.les_flags)
                 energies.append(e_sr + e_lr.sum())
             else:
-                energies.append(model.forward_pbc(
-                    pos_in, d['types'], d['edge_i'], d['edge_j'], shift_e_in,
-                    d['nb_src'], d['nb_dst'], shift_nb_in))
+                energies.append(out)
         energies = torch.stack(energies)
 
         forces_list = stress_list = None
@@ -498,7 +588,7 @@ def train_ecenet_xyz(
                      else torch.zeros_like(strain_leaf[k])) / batch[k]['volume']
                     for k in range(B)
                 ]
-        return energies, forces_list, stress_list
+        return energies, forces_list, stress_list, mix_weights
 
     def _train_mode(train):
         model.train(train)
@@ -527,7 +617,7 @@ def train_ecenet_xyz(
         for start in range(0, len(data), eval_batch_size):
             batch = data[start:start + eval_batch_size]
             with torch.enable_grad():
-                energies, forces_list, stress_list = predict(batch, create_graph=False)
+                energies, forces_list, stress_list, _ = predict(batch, create_graph=False)
             for k, d in enumerate(batch):
                 e_acc += _err((energies[k] - d['energy']) / d['n_atoms']).item()
                 if forces_list is not None:
@@ -539,6 +629,21 @@ def train_ecenet_xyz(
             n += len(batch)
         _train_mode(True)
         return _final(e_acc, n), _final(f_acc, f_count), _final(s_acc, s_count)
+
+    @torch.no_grad()
+    def expert_usage(data, max_samples=32):
+        """Mean weight per expert over a sample of `data` — the collapse monitor.
+
+        A row that has drifted to (1, 0, …, 0) means one expert is answering
+        everywhere and the rest are dead weight; `moe_diversity_weight` is the
+        lever against that.
+        """
+        sample = data[:max_samples]
+        if not sample:
+            return None
+        with torch.enable_grad():
+            _, _, _, weights = predict(sample, create_graph=False)
+        return torch.cat(weights, dim=0).mean(0)
 
     # ── Training loop ─────────────────────────────────────────────────────
     if verbose:
@@ -565,7 +670,7 @@ def train_ecenet_xyz(
             n_batches += 1
             optimizer.zero_grad()
 
-            energies, forces_list, stress_list = predict(batch, create_graph=True)
+            energies, forces_list, stress_list, mix_weights = predict(batch, create_graph=True)
             eng_tgt = torch.stack([d['energy'] for d in batch])
             n_atoms_b = torch.tensor([d['n_atoms'] for d in batch],
                                      dtype=dtype, device=device)
@@ -583,8 +688,14 @@ def train_ecenet_xyz(
                 if terms:
                     stress_loss = sum(terms) / len(terms)
 
+            div_loss = energies.new_zeros(())
+            if moe_diversity_weight:
+                div_loss = diversity_loss(torch.cat(mix_weights, dim=0),
+                                          moe_diversity_kind)
+
             total_loss = (energy_weight * energy_loss + force_weight * force_loss
-                          + stress_weight * stress_loss)
+                          + stress_weight * stress_loss
+                          + moe_diversity_weight * div_loss)
             total_loss.backward()
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
@@ -624,6 +735,11 @@ def train_ecenet_xyz(
                 btsfx = f" S={best_test[2]:.4f}" if use_stress else ""
                 bt = (f" [test E={best_test[0]:.4f} F={best_test[1]:.4f}{btsfx}]"
                       if test_data else "")
+                if use_moe:
+                    usage = expert_usage(val_data or train_data)
+                    if usage is not None:
+                        print_flush("    experts [" + " ".join(f"{u:.3f}" for u in usage)
+                                    + f"]  ({moe_mixture}, {moe_scope}-scope)")
                 print_flush(
                     f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | [{eval_metric}] "
                     f"train E={tr_e:.4f} F={tr_f:.4f} | val E={va_e:.4f} F={va_f:.4f}{ssfx} | "

@@ -16,6 +16,8 @@ ecenet/
   model.py         ECENet — the model (message passing when n_mp >= 2)
   equivariant.py   EquivariantLinear, RealSpaceNonlinearity
   film.py          ElementFiLM — element(+distance)-conditioned edge gate
+  electronic.py    total-charge / total-spin conditioning (charge_spin=True)
+  moe.py           mixture-of-experts read-out (EVB / MoE / softmin) + diversity loss
   les.py           LESLongRange — optional long-range add-on (wraps the `les` package)
   ace_basis.py     analytic ACE basis + Wigner-rotation autograd functions
   spherical.py     real spherical harmonics, Clebsch–Gordan, Wigner-D (recursion + rotation)
@@ -28,6 +30,7 @@ scripts/               training / data entry points (run from the repo root)
   train_ecenet_spice.py  SPICE multi-molecule training (10 elements, DDP)
   train_ecenet_mptrj.py  MPtrj training (periodic crystals, ~89 elements, stress)
   train_ecenet_xyz.py    small ASE/extxyz datasets (single-process; optional joint LES)
+  train_ecenet_moe.py    mixture-of-experts entry point + `compare_mixtures` baselines
   prepare_mptrj.py       tensorise raw MPtrj JSON → .pt shards
   eval_spice.py          evaluate a SPICE checkpoint on the test set
 
@@ -128,6 +131,170 @@ commutes with the bond frame's per-mode SO(2) rotation; the structural-zero slot
 (`m > l` of that channel) are masked to `γ=1`. An additive shift does *not*
 commute with that rotation, so `β` lands on the `m=0` slot of `A_cos` only — the
 rotation-invariant mode, and the one place a shift is exactly equivariant.
+
+### Charge and spin
+
+By default ECENet is a pure function of geometry and composition: a cation and
+its neutral parent, frozen at the same geometry, are the same input and get the
+same energy. `charge_spin=True` adds the missing variable — the structure's
+**total charge** `Q` (in e) and **total spin** `S` (unpaired electrons,
+`multiplicity - 1`) — passed per call on every forward path:
+
+```python
+model = ECENet(..., charge_spin=True)
+
+model(pos, types)                                     # neutral, closed shell
+model(pos, types, total_charge=1.0)                   # cation
+model(pos, types, total_charge=-1.0, total_spin=1.0)  # doublet anion
+model.forward_batch_multi(pos_list, types_list,       # per-structure states
+                          total_charge=[0., 1., -1.], total_spin=[0., 0., 1.])
+```
+
+Omitting them means neutral and closed-shell, which is why every existing call
+site keeps working. A model built *without* `charge_spin` that is handed a
+nonzero charge warns once rather than quietly returning the neutral energy.
+
+The state reaches the model as the invariant vector `[Q, S, Q/N, S/N]`
+(`ecenet/electronic.py`) at two sites, both identity at initialisation:
+
+| option | effect |
+| --- | --- |
+| `charge_spin_film` | a FiLM gate on the edge features, beside the element gate — the site that reaches everything downstream (energies, forces, LES latent charges, mixture invariants). Default `True` |
+| `charge_spin_atomic` | a per-atom state-conditioned energy added to the `atomic_energy` baseline. Edge-free, so it is the only term that survives for an isolated ion. Default `True` |
+| `charge_spin_embed_dim` | width of the element embedding in both heads (default 16) |
+| `charge_spin_hidden` | hidden width(s) of both heads |
+| `charge_spin_per_m` | per-`(channel, m)` gate instead of per-channel, exactly as `film_per_m` |
+| `charge_spin_shift` | the gate also emits the `m=0` shift `β`, as `film_shift` (default `True`) |
+
+Both `Q, S` and `Q/N, S/N` are supplied on purpose. The intensive pair is what
+keeps a sum-of-local-terms energy size-consistent — two copies of a `+1` ion see
+the same `Q/N` as one — while the extensive pair is needed because the response
+to adding *one* electron is not intensive at all (the electron affinity of a
+10-atom cluster is not a tenth of a 100-atom one's).
+
+The gate is equivariant for the same reason the element gate is: the state
+vector is an invariant scalar, `γ` is shared by `cos` and `sin` of a given
+`(channel, m)`, and `β` touches the `m=0` slot only. Energy stays continuous at
+`r_cut_edge`, forces stay conservative, and double backward (force training)
+works.
+
+#### At inference (ASE)
+
+`ECENetCalculator` reads the state off each `Atoms` object — most explicit
+first: a calculator-level `charge=` / `spin=` override, then `atoms.info`
+(`'charge'`/`'total_charge'`, and `'spin'`/`'total_spin'` or
+`'multiplicity'`/`'spin_multiplicity'`, the keys extended-XYZ round-trips), then
+`get_initial_charges().sum()` / `|get_initial_magnetic_moments().sum()|`.
+
+```python
+calc = load_calculator('model.mdl')
+
+atoms.info['charge'] = 1          # or atoms.info['multiplicity'] = 3
+atoms.calc = calc
+atoms.get_potential_energy()      # the cation's energy
+
+calc = load_calculator('model.mdl', charge=1)   # fix the state for a whole MD run
+```
+
+ASE's own `check_state` ignores `atoms.info`, so the calculator extends it: a
+change of charge or spin invalidates the cached result, and
+`atoms.info['charge'] = 1` means what it says even on a calculator that has
+already seen the neutral geometry.
+
+> **Training.** The trainers accept and record every `charge_spin_*` flag, so a
+> charge-aware architecture round-trips through a checkpoint, but they do not
+> yet read a per-structure charge/spin out of their datasets — a run today
+> trains the state heads on `Q = S = 0` alone. Feeding real states in is the
+> next step.
+
+### Mixture of experts (EVB)
+
+`n_experts=K` replaces the single scalar read-out with **K expert energies plus
+learned couplings**, mixed by the empirical-valence-bond construction: build a
+real-symmetric Hamiltonian from the experts and take its lowest eigenvalue.
+
+$$H_{ij}(\mathbf R) = \delta_{ij}V_i(\mathbf R) + (1-\delta_{ij})C_{ij}(\mathbf R),
+\qquad V_{\mathrm{EVB}} = \lambda_{\min}[\mathbf H],
+\qquad w_i = c_{0i}^2$$
+
+The gate and the expert coupling become one object — the ground-state
+eigenvector — instead of a softmax bolted on beside the experts. For two experts
+the eigenvalue is closed form,
+
+$$V = \tfrac12(V_A+V_B) - \sqrt{\tfrac14(V_A-V_B)^2 + C^2},$$
+
+a hyperbolic regularisation of `min(V_A, V_B)`: far from a crossing the lower
+expert dominates, near one the coupling opens a smooth avoided crossing, and at
+`C = 0` it degenerates exactly to the hard minimum. Unlike a convex mixture the
+result sits *below* every expert, so the experts are best read as a learned
+diabatic basis rather than as physical energies in their own right.
+
+```python
+train_ecenet_moe(..., n_experts=4, moe_mixture='evb')      # the EVB mixture
+train_ecenet_moe(..., n_experts=4, moe_mixture='moe')      # softmax-gated baseline
+compare_mixtures(..., n_experts=4)                          # all rules, one split
+```
+
+`scripts/train_ecenet_moe.py` is the entry point (a thin layer over the
+small-dataset trainer, which carries the diversity regulariser and the per-epoch
+`experts [...]` usage log); `compare_mixtures` trains the same architecture under
+each rule so a table difference is a mixing-rule difference and nothing else.
+
+Those runs share a trunk but *not* a parameter count — K expert heads plus
+K(K-1)/2 coupling heads cost more read-out weights than one head.
+`matched_single_head` supplies the control that holds capacity fixed instead: it
+solves for the read-out width that makes a plain `n_experts=1` model the same
+size, spending the extra parameters where the mixture spends them, so a
+difference is attributable to the read-out's *structure*.
+
+```python
+ARCH = dict(n_experts=4, l_max=3, embed_dim=32, n_layers=2, n_max_d=8, n_mp=2)
+train_ecenet_moe(**ARCH, ...)                          # the mixture
+train_ecenet_xyz(**matched_single_head(**ARCH), ...)   # same size, one head
+```
+
+Widening the *trunk* to match instead (`embed_dim`, `n_layers`) answers a
+different question — whether those parameters would have been better spent on
+the encoder — and neither control subsumes the other.
+
+| option | effect |
+| --- | --- |
+| `n_experts` | K. `1` (default) is the plain single-head model — no mixture parameters, unchanged numerics |
+| `moe_mixture` | `'evb'` (coupled eigenvalue), `'moe'` (softmax gate, the baseline), `'softmin'` (`-τ log Σ e^{-V_i/τ}`), `'mean'` |
+| `moe_scope` | `'atom'` (default): one K×K problem per atom. `'global'`: one per structure — the literal EVB formulation |
+| `moe_coupling` | `'mlp'` learned `C(R)`, `'const'` per-type constants, `'none'` → `C ≡ 0`, i.e. `min_i V_i` |
+| `moe_coupling_topology` | `'full'`, `'chain'` (sparse tridiagonal H), `'none'` |
+| `moe_coupling_init` | initial per-(type, pair) coupling in eV/atom; nonzero on purpose (see below) |
+| `moe_expert_init` | std of the per-(type, expert) baseline — the symmetry breaker between experts |
+| `moe_diversity_weight` | weight of the expert-collapse regulariser (`'load'`, `'entropy'` or `'cv'`); a *training* option, not saved in `hparams` |
+| `moe_freeze_experts` | stage 2 of the two-stage recipe: restart from a specialised checkpoint and train *only* the couplings |
+
+**Forces come out conservative for free.** Hellmann–Feynman gives
+`F = -c₀ᵀ(∇H)c₀` = weighted expert forces + coupling forces, and since the model
+is still a plain differentiable scalar, autograd computes exactly that — verified
+against an explicit frozen-eigenvector construction in `tests/test_moe.py`.
+
+**Two things to know before turning it on.**
+
+*Scope and size consistency.* λ_min is superadditive, so `moe_scope='global'`
+does **not** decompose over non-interacting subsystems: two molecules 60 Å apart
+give more than the sum of their energies. The default `'atom'` scope solves one
+Hamiltonian per atom and is exactly additive, keeps the read-out local like the
+rest of the model, and makes the couplings intensive. Use `'global'` for
+fixed-size systems or to reproduce the theory as written.
+
+*Degeneracy and the gap.* The gradient of an eigenvalue never needs a gap, but
+the *second* derivative — which is what force training differentiates through —
+scales as `1/(E₁-E₀)`. Nonzero couplings keep that gap open (it is `2|C|` at
+K=2), which is why `moe_coupling_init` defaults to a nonzero value and why K=2
+uses the analytic closed form rather than an eigensolver. A run with all
+couplings driven to zero *and* two experts crossing is the case to watch.
+
+*Expert collapse* is the standard MoE failure mode and survives translation: if
+one expert sits below the others everywhere, `c₀ → (1, 0, …, 0)` and the rest are
+dead weight. Watch the `experts [...]` line; `moe_diversity_weight` is the blunt
+lever, and specialising the experts through the training data is usually the
+better one.
 
 ### Message passing
 
@@ -528,6 +695,8 @@ The test suite is pure PyTorch and runs on CPU. Each file is runnable as a scrip
 python tests/test_ecenet.py                  # ECENet integration: SO(3) invariance, forces, MP
 python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
 python tests/test_element_film.py            # FiLM gate: identity at init, SO(3), per-m, shift
+python tests/test_charge_spin.py             # charge/spin conditioning: identity at init, SO(3), forward paths, ASE state + cache
+python tests/test_moe.py                     # EVB mixture: eigenvalue algebra, Hellmann-Feynman, size consistency, baselines
 python tests/test_spice_trainer.py            # SPICE trainer: atom-budget batching, DDP invariant
 python tests/test_attention_mp.py            # attention MP: SO(3), cutoff continuity, sum vs softmax
 python tests/test_les.py                     # LES: l0/l1 read-out SO(3) + batch/PBC consistency; wrapper lazy import

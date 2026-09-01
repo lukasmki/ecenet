@@ -180,10 +180,35 @@ def train_ecenet(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
+    # Total-charge / total-spin conditioning (ecenet/electronic.py). Off by
+    # default; the model is then a pure function of geometry and composition.
+    # NOTE: this trainer does not yet read a per-structure charge/spin out of
+    # its dataset, so a run with charge_spin=True trains the state heads on the
+    # neutral, closed-shell state alone (Q = S = 0 for every frame). The flags
+    # are here so a charge-aware architecture round-trips through a checkpoint;
+    # feeding real states in is the next step.
+    charge_spin=False,
+    charge_spin_film=True,      # FiLM gate on the edge features (identity at init)
+    charge_spin_atomic=True,    # per-atom state-conditioned energy (zero at init)
+    charge_spin_embed_dim=16,
+    charge_spin_hidden=None,
+    charge_spin_per_m=False,    # per-(channel, m) gate, as film_per_m
+    charge_spin_shift=True,     # gate also emits the m=0 shift, as film_shift
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,      # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
+    # Mixture of experts (n_experts=1 → the plain single-head read-out; ecenet/moe.py)
+    n_experts=1,                  # K expert (diabatic) heads over the shared trunk
+    moe_mixture='evb',            # 'evb' | 'moe' | 'softmin' | 'mean'
+    moe_scope='atom',             # 'atom' (size-consistent) | 'global' (whole structure)
+    moe_coupling='mlp',           # 'mlp' | 'const' | 'none' (C ≡ 0 → hard min over experts)
+    moe_coupling_topology='full', # 'full' | 'chain' | 'none' — which expert pairs couple
+    moe_coupling_init=0.05,       # initial per-(type, pair) atomic coupling, eV/atom
+    moe_coupling_positive=False,  # softplus the assembled coupling so C > 0
+    moe_expert_init=0.05,         # std of the per-(type, expert) baseline (breaks expert symmetry)
+    moe_tau=0.1,                  # softmin temperature, eV/atom
+    moe_gap_eps=1e-12,            # radicand floor in the K=2 closed-form eigenvalue
     # Joint LES long-range training: E = E_sr + E_lr on one autograd graph
     # (isolated pairwise path — rMD17/MD22 molecules have no cell). NOTE on
     # units: these datasets are in kcal/mol while the LES Coulomb constant is
@@ -283,10 +308,27 @@ def train_ecenet(
         element_film=element_film, film_embed_dim=film_embed_dim,
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
+        charge_spin=charge_spin,
+        charge_spin_film=charge_spin_film,
+        charge_spin_atomic=charge_spin_atomic,
+        charge_spin_embed_dim=charge_spin_embed_dim,
+        charge_spin_hidden=charge_spin_hidden,
+        charge_spin_per_m=charge_spin_per_m,
+        charge_spin_shift=charge_spin_shift,
         les_readout=les_readout,
         les_charge_scale=les_charge_scale,
         les_dipole=les_dipole,
         les_charges=les_charges,
+        n_experts=n_experts,
+        moe_mixture=moe_mixture,
+        moe_scope=moe_scope,
+        moe_coupling=moe_coupling,
+        moe_coupling_topology=moe_coupling_topology,
+        moe_coupling_init=moe_coupling_init,
+        moe_coupling_positive=moe_coupling_positive,
+        moe_expert_init=moe_expert_init,
+        moe_tau=moe_tau,
+        moe_gap_eps=moe_gap_eps,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -462,10 +504,27 @@ def train_ecenet(
                 element_film=element_film, film_embed_dim=film_embed_dim,
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
+                charge_spin=charge_spin,
+                charge_spin_film=charge_spin_film,
+                charge_spin_atomic=charge_spin_atomic,
+                charge_spin_embed_dim=charge_spin_embed_dim,
+                charge_spin_hidden=charge_spin_hidden,
+                charge_spin_per_m=charge_spin_per_m,
+                charge_spin_shift=charge_spin_shift,
                 les_readout=les_readout,
                 les_charge_scale=les_charge_scale,
                 les_dipole=les_dipole,
                 les_charges=les_charges,
+                n_experts=n_experts,
+                moe_mixture=moe_mixture,
+                moe_scope=moe_scope,
+                moe_coupling=moe_coupling,
+                moe_coupling_topology=moe_coupling_topology,
+                moe_coupling_init=moe_coupling_init,
+                moe_coupling_positive=moe_coupling_positive,
+                moe_expert_init=moe_expert_init,
+                moe_tau=moe_tau,
+                moe_gap_eps=moe_gap_eps,
             ),
             # molecule-specific element mapping: {symbol: type_index}
             'element_to_type': elements.to_element_to_type(type_to_idx),

@@ -3,6 +3,8 @@ SO(2) features.
 
 Public API:
     ECENet               — the model (message passing on when n_mp >= 2)
+    MixtureReadout       — K-expert read-out (EVB / MoE / softmin); ECENet(n_experts>1)
+    diversity_loss       — expert-collapse regulariser for mixture training
     ECENetCalculator     — ASE calculator wrapper (lazy import; needs `ase`)
     ECENetLESCalculator  — ASE calculator for joint-LES checkpoints
                            (E_sr + E_lr; lazy; needs `ase` and `les`)
@@ -10,8 +12,10 @@ Public API:
 """
 
 from ecenet.model import ECENet
+from ecenet.moe import MixtureReadout, diversity_loss
 
-__all__ = ["ECENet", "ECENetCalculator", "ECENetLESCalculator", "LESLongRange"]
+__all__ = ["ECENet", "MixtureReadout", "diversity_loss",
+           "ECENetCalculator", "ECENetLESCalculator", "LESLongRange"]
 
 
 def __getattr__(name):

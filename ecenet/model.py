@@ -36,8 +36,10 @@ import torch.nn as nn
 
 from ecenet.ace_basis import ACEBasisAnalytic
 from ecenet.edge_frame_kernel import edge_frame_fused, edge_frame_fused_single, pack_unrotate_fused
+from ecenet.electronic import N_STATE_FEATURES, StateAtomicEnergy, is_nonzero, state_features
 from ecenet.equivariant import EquivariantLinear, RealSpaceNonlinearity
 from ecenet.film import ElementFiLM
+from ecenet.moe import MixtureReadout
 from ecenet.radial import find_edges, get_cutoff_fn, radial_basis
 from ecenet.spherical import build_D1_from_rhat, build_D_block, spherical_harmonics_float64, wigner_rotate
 
@@ -45,6 +47,17 @@ from ecenet.spherical import build_D1_from_rhat, build_D_block, spherical_harmon
 # head bypassed via l0_is_charge). The single definition — consumers read the
 # derived facts off the model via `les_flags` rather than re-spelling this.
 _LES_EDGE_MODES = ('edge', 'edge_basis')
+
+def _with_mixture(result, info, return_mixture):
+    """Append the mixture diagnostics to a forward's return value when asked.
+
+    Keeps every existing return signature byte-identical when
+    return_mixture=False (the only case a single-head model can reach).
+    """
+    if not return_mixture:
+        return result
+    return (*result, info) if isinstance(result, tuple) else (result, info)
+
 
 # ---------------------------------------------------------------------------
 # Main model
@@ -127,6 +140,80 @@ class ECENet(nn.Module):
                         γ⊙x + β) as an extra head on the same MLP. β lands on the
                         m=0 slot of A_cos only — the invariant mode, the only place
                         an additive shift preserves equivariance.
+        charge_spin:    if True the model additionally consumes the structure's
+                        **total charge Q** (e) and **total spin S** (unpaired
+                        electrons, = multiplicity - 1), passed per call as
+                        ``forward(..., total_charge=, total_spin=)`` on every
+                        forward path. Without it the model is a pure function of
+                        geometry and composition, so a cation and its neutral
+                        parent at the same geometry are indistinguishable inputs.
+                        Off by default and free: no parameters, no state-dict
+                        keys, and the read-out path is bit-for-bit unchanged.
+                        See ecenet/electronic.py for the state vector
+                        ``[Q, S, Q/N, S/N]`` and why both halves are there.
+                        Omitting ``total_charge``/``total_spin`` at call time
+                        means *neutral, closed shell* (Q = S = 0) — the right
+                        default, and the reason existing call sites keep working
+                        — so a charged system must say so explicitly.
+        charge_spin_film:   condition the edge features on the state, via a FiLM
+                        gate beside the element one (identity at init). The site
+                        that reaches everything downstream: energies, forces, LES
+                        latent charges, mixture invariants. Default True.
+        charge_spin_atomic: add a per-atom state-conditioned energy (element
+                        embedding + state vector → scalar; zero at init) — the
+                        non-geometric part of the response, and the only term
+                        that survives for an isolated ion with no edges left
+                        inside r_cut_edge. Default True. At least one of the two
+                        sites must be on.
+        charge_spin_embed_dim: width of the element embedding in both state heads
+        charge_spin_hidden:    hidden width(s) of both state heads (None → their
+                        own defaults; see ecenet/film.py and electronic.py)
+        charge_spin_per_m:  per-(channel, m) state gate rather than per-channel,
+                        exactly as ``film_per_m`` (same structural-zero masking)
+        charge_spin_shift:  the state gate also predicts the m=0 shift β, as
+                        ``film_shift`` does. Default True — an invariant additive
+                        offset on the invariant mode is the most direct way for
+                        the state to move an energy.
+        n_experts:      K > 1 replaces the single scalar read-out with a
+                        mixture of K expert (diabatic) heads over the same
+                        shared per-edge invariants — see ecenet/moe.py. K=1
+                        (default) is the plain single-head model, bit-for-bit:
+                        no mixture parameters are created and the read-out path
+                        is untouched.
+        moe_mixture:    how the experts combine (n_experts > 1 only).
+                          'evb' (default): the lowest eigenvalue of the coupled
+                            Hamiltonian H = diag(V) + C — coupled variational
+                            state selection, with expert weights emerging as the
+                            ground-state eigenvector's squared coefficients and
+                            forces satisfying Hellmann–Feynman by construction.
+                          'moe': ordinary mixture of experts — a softmax gate on
+                            the shared representation, V = Σ w_i V_i. The
+                            controlled baseline: identical experts, soft state
+                            selection instead of coupled selection.
+                          'softmin': -τ log Σ exp(-V_i/τ), the entropic smoothing
+                            of min_i V_i, for comparison against EVB's hyperbolic
+                            one.
+                          'mean': plain average, the no-gating control.
+        moe_scope:      'atom' (default) solves one K×K problem per atom and sums
+                        the ground states — size-consistent, local, and the
+                        couplings stay intensive. 'global' solves one per
+                        structure (the literal EVB formulation), which is NOT
+                        size-consistent because λ_min is subadditive; use it for
+                        fixed-size systems or to reproduce the theory.
+        moe_coupling:   'mlp' (learned C(R)), 'const' (per-type constants only)
+                        or 'none' (C ≡ 0, so EVB degenerates to min_i V_i).
+        moe_coupling_topology: 'full' | 'chain' | 'none' — which expert pairs
+                        couple; 'chain' gives the sparse tridiagonal H.
+        moe_coupling_init:     initial per-(type, pair) atomic coupling in
+                        eV/atom. Nonzero on purpose: it opens the E1-E0 gap at
+                        init, which conditions the eigenvalue derivatives.
+        moe_coupling_positive: softplus the assembled coupling so C > 0
+                        (moe_coupling_init then reads as a pre-activation).
+        moe_expert_init: std of the random per-(type, expert) atomic energies —
+                        the symmetry breaker that keeps the experts from
+                        starting as clones of one another.
+        moe_tau:        softmin temperature in eV/atom (scaled by segment size).
+        moe_gap_eps:    radicand floor in the K=2 closed-form eigenvalue.
     """
 
     def __init__(
@@ -159,10 +246,27 @@ class ECENet(nn.Module):
         film_hidden=None,
         film_per_m: bool = False,
         film_shift: bool = False,
+        charge_spin: bool = False,
+        charge_spin_film: bool = True,
+        charge_spin_atomic: bool = True,
+        charge_spin_embed_dim: int = 16,
+        charge_spin_hidden=None,
+        charge_spin_per_m: bool = False,
+        charge_spin_shift: bool = True,
         les_readout: str = 'sum',
         les_charge_scale: float = 1.0,
         les_dipole: bool = False,
         les_charges: bool = True,
+        n_experts: int = 1,
+        moe_mixture: str = 'evb',
+        moe_scope: str = 'atom',
+        moe_coupling: str = 'mlp',
+        moe_coupling_topology: str = 'full',
+        moe_coupling_init: float = 0.05,
+        moe_coupling_positive: bool = False,
+        moe_expert_init: float = 0.05,
+        moe_tau: float = 0.1,
+        moe_gap_eps: float = 1e-12,
     ):
         super().__init__()
         if mp_type == 'transformer':
@@ -345,13 +449,10 @@ class ECENet(nn.Module):
                 warnings.warn(
                     f"{', '.join(_set)} ignored: they configure the FiLM gate, "
                     "which is off (element_film=False).", stacklevel=2)
-        film_n_modes, film_mode_valid = 1, None
-        if self.film_per_m:
-            film_n_modes = self.n_angular
-            l_of_c = torch.arange(self.n_features_per_m) % (l_max + 1)
-            film_mode_valid = (torch.arange(film_n_modes)[None, :]
-                               <= l_of_c[:, None]).to(torch.get_default_dtype())
-        if self.film_shift:
+        film_n_modes, film_mode_valid = self._film_mode_layout(self.film_per_m)
+        # The m=0 selector is shared by every FiLM gate that emits a shift —
+        # the element one and the charge/spin one below.
+        if self.film_shift or (charge_spin and charge_spin_film and charge_spin_shift):
             # one-hot selector for m=0, to add β without an in-place index write
             m0 = torch.zeros(1, 1, self.n_angular)
             m0[..., 0] = 1.0
@@ -426,7 +527,12 @@ class ECENet(nn.Module):
         mlp_dims = [in_dim] + list(hidden_dims) + [n_output_out]
         act = {'silu': nn.SiLU, 'tanh': nn.Tanh, 'relu': nn.ReLU,
                'gelu': nn.GELU}.get(activation, nn.SiLU)
-        self.output_net = OutputMLP(mlp_dims, activation=act())
+        # Skipped entirely under a mixture read-out (n_experts > 1), which
+        # replaces this head with its own: building it anyway would leave ~17k
+        # parameters that no forward path touches, inflating every parameter
+        # count the model is compared on.
+        self.output_net = (OutputMLP(mlp_dims, activation=act())
+                           if n_experts == 1 else None)
 
         # 'edge_basis' charge head: same dims/activation as output_net (built
         # here so it mirrors the readout config exactly). zero_init_last=False:
@@ -448,7 +554,89 @@ class ECENet(nn.Module):
             # dipole — see the saddle note at the les_charges check above
 
         # ── Per-type atomic energy baseline ──────────────────────────────
+        # Shared by every expert under a mixture read-out: H + f(R)·I shifts all
+        # eigenvalues by f(R), so a common diagonal term is exactly separable
+        # from the mixture (the EVB gauge freedom).
         self.atomic_energy = nn.Parameter(torch.zeros(n_types))
+
+        # ── Mixture-of-experts read-out (optional) ───────────────────────
+        # Replaces output_net + the per-edge energy sum with K expert heads and
+        # a mixing rule. Left as None at K=1 so the default model keeps exactly
+        # the parameters, state-dict keys and numerics it had before.
+        self.n_experts = int(n_experts)
+        self.moe_mixture = moe_mixture
+        self.moe_scope = moe_scope
+        self.mixture_head = None
+        if self.n_experts > 1:
+            self.mixture_head = MixtureReadout(
+                n_types=n_types, n_features=self.n_features_per_m,
+                n_max_d=n_max_d, r_cut=self.r_cut_edge,
+                cutoff_type=cutoff_type, hidden_dims=hidden_dims,
+                activation=activation, n_experts=self.n_experts,
+                mixture=moe_mixture, scope=moe_scope,
+                coupling=moe_coupling, coupling_topology=moe_coupling_topology,
+                coupling_init=moe_coupling_init,
+                coupling_positive=moe_coupling_positive,
+                expert_init=moe_expert_init, tau=moe_tau, gap_eps=moe_gap_eps)
+
+        # ── Total-charge / total-spin conditioning (optional) ────────────────
+        # Built last, like the mixture head: nothing above it draws from the RNG
+        # after this point, so turning charge_spin on leaves a seeded model's
+        # trunk weights bit-identical and a matched state-blind control is one
+        # flag away.
+        # The state vector [Q, S, Q/N, S/N] (ecenet/electronic.py) enters at two
+        # places, both identity at init so switching the flag on leaves a model's
+        # step-0 predictions untouched:
+        #   state_film   — a FiLM gate on the edge features, the same generator as
+        #     the element gate with the state as its extra invariant leg. It runs
+        #     AFTER the element gate, so the two compose as γ_state ⊙ (γ_elem ⊙ A
+        #     + β_elem) + β_state; both are invariant scalars, so the order is a
+        #     parameterisation choice, not a correctness one.
+        #   state_energy — a per-atom state-conditioned atomic energy, added
+        #     beside `atomic_energy`. Edge-free by construction, so it is what
+        #     keeps a lone ion distinguishable from a lone neutral atom once
+        #     every neighbour has left r_cut_edge.
+        # Nothing here redistributes charge between atoms: this is conditioning,
+        # not charge equilibration (see the electronic.py module docstring).
+        self.charge_spin = bool(charge_spin)
+        self.state_film = None
+        self.state_energy = None
+        if charge_spin:
+            if not (charge_spin_film or charge_spin_atomic):
+                raise ValueError(
+                    "charge_spin=True needs at least one conditioning site: "
+                    "charge_spin_film and/or charge_spin_atomic. With both off "
+                    "the state would be read and then dropped.")
+            if charge_spin_film:
+                cs_n_modes, cs_mode_valid = self._film_mode_layout(charge_spin_per_m)
+                self.state_film = ElementFiLM(
+                    self.n_features_per_m, n_types,
+                    embed_dim=charge_spin_embed_dim, n_rbf=0,
+                    n_extra=N_STATE_FEATURES, hidden=charge_spin_hidden,
+                    shift=bool(charge_spin_shift), n_modes=cs_n_modes,
+                    mode_valid=cs_mode_valid)
+            if charge_spin_atomic:
+                self.state_energy = StateAtomicEnergy(
+                    n_types, embed_dim=charge_spin_embed_dim,
+                    hidden=charge_spin_hidden)
+        else:
+            # Warn rather than silently ignore (repo convention): a configured
+            # state head that is never built looks like it was applied.
+            _cs_set = [nm for nm, v, d in (
+                ('charge_spin_film', charge_spin_film, True),
+                ('charge_spin_atomic', charge_spin_atomic, True),
+                ('charge_spin_embed_dim', charge_spin_embed_dim, 16),
+                ('charge_spin_hidden', charge_spin_hidden, None),
+                ('charge_spin_per_m', charge_spin_per_m, False),
+                ('charge_spin_shift', charge_spin_shift, True)) if v != d]
+            if _cs_set:
+                warnings.warn(
+                    f"{', '.join(_cs_set)} ignored: they configure the "
+                    "charge/spin conditioning, which is off "
+                    "(charge_spin=False).", stacklevel=2)
+        # One-shot guard so a state-blind model complains once, not once per
+        # forward, when it is handed a charge or spin it cannot use.
+        self._warned_charge_spin = False
 
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -516,6 +704,63 @@ class ECENet(nn.Module):
         W_i = self.W[types]  # (n_atoms, n_types, n_max, embed_dim)
         return torch.einsum('itns,itnc->ics', A, W_i)
 
+    def _film_mode_layout(self, per_m):
+        """(n_modes, mode_valid) for a FiLM gate over the angular layout.
+
+        per_m=False → (1, None): one scale per channel, broadcast over m.
+        per_m=True  → (n_angular, mask): a scale per (channel, m), with the
+        structural-zero slots (m > l of that channel) masked off so the gate
+        leaves them exactly as it found them. Shared by the element gate and the
+        charge/spin gate — same feature layout, same mask.
+        """
+        if not per_m:
+            return 1, None
+        n_modes = self.n_angular
+        l_of_c = torch.arange(self.n_features_per_m) % (self.l_max + 1)
+        mode_valid = (torch.arange(n_modes)[None, :]
+                      <= l_of_c[:, None]).to(torch.get_default_dtype())
+        return n_modes, mode_valid
+
+    def _state_features(self, total_charge, total_spin, atom_counts, device, dtype):
+        """(B, N_STATE_FEATURES) electronic-state vector, or None if unused.
+
+        None comes back for a model built without ``charge_spin``; the forward
+        paths then skip every state term, which is what keeps the default model
+        bit-for-bit what it was. Such a model handed a *nonzero* charge or spin
+        warns once — silently ignoring it would return a neutral-system energy
+        under a charged system's label, which is exactly the failure this
+        feature exists to prevent.
+        """
+        if not self.charge_spin:
+            if not self._warned_charge_spin and (is_nonzero(total_charge)
+                                                 or is_nonzero(total_spin)):
+                self._warned_charge_spin = True
+                warnings.warn(
+                    "total_charge / total_spin ignored: this model was built "
+                    "with charge_spin=False, so it has no way to consume them "
+                    "and the energy returned is the neutral, closed-shell one. "
+                    "Rebuild with ECENet(charge_spin=True) to condition on the "
+                    "electronic state.", stacklevel=3)
+            return None
+        return state_features(total_charge, total_spin, atom_counts, device, dtype)
+
+    def _apply_state_film(self, A_cos, A_sin, type_i, type_j, state_edge):
+        """Charge/spin FiLM scale (and m=0 shift) on the edge features.
+
+        The state vector is an invariant scalar, so this is equivariant for
+        exactly the reason the element gate is: γ is shared by cos and sin of a
+        given (channel, m), and β touches the m=0 slot of A_cos alone.
+        """
+        if state_edge is None:
+            raise ValueError(
+                "charge_spin model reached the state FiLM gate without a state "
+                "vector — every forward path must build one (see "
+                "_state_features).")
+        gamma, beta = self.state_film(type_i, type_j, extra=state_edge)
+        if gamma.dim() == 2:
+            gamma = gamma.unsqueeze(-1)          # broadcast over m
+        return self._film_apply(A_cos, A_sin, gamma, beta)
+
     def _apply_element_film(self, A_cos, A_sin, type_i, type_j, dist_ij):
         """Element(+distance)-conditioned FiLM scale on A_cos/A_sin.
 
@@ -556,7 +801,10 @@ class ECENet(nn.Module):
         return A_cos[:, :, 0]
 
     def _apply_output(self, invariants, dist_ij):
-        """output_net(inv) → per-edge energies.
+        """output_net(inv) → per-edge energies (single-head read-out only).
+
+        n_experts > 1 has no output_net: _readout_energy routes to the mixture
+        head instead, and this method is never reached.
 
         n_max_d=None: the readout emits a single number per edge, multiplied by
         the cutoff envelope f(r) so the per-edge energy still decays smoothly to
@@ -570,6 +818,50 @@ class ECENet(nn.Module):
         env = get_cutoff_fn(self.cutoff_type)(dist_ij, self.r_cut_edge)   # (n_e,) smooth → 0 at r_cut
         return self.output_net(invariants).squeeze(-1) * env
 
+    def _mixture_readout(self, invariants, dist_ij, types, edge_atom,
+                         atom_struct=None, n_struct=1):
+        """Per-structure mixture energies, for n_experts > 1 (see ecenet/moe.py).
+
+        ``invariants=None`` is the zero-edge case: the head then sees an empty
+        edge set and falls back to its per-(type, expert) atomic constants, so
+        the energy stays continuous as the last neighbour crosses r_cut —
+        exactly what _edgeless_result does for the single-head read-out.
+
+        Returns (energies (n_struct,), info); the caller adds the shared
+        atomic_energy baseline, which sits outside the Hamiltonian by gauge
+        freedom.
+        """
+        if invariants is None:
+            invariants = self.atomic_energy.new_zeros(0, self.n_features_per_m)
+            dist_ij = self.atomic_energy.new_zeros(0)
+            edge_atom = torch.zeros(0, dtype=torch.long, device=types.device)
+        return self.mixture_head(invariants, dist_ij, types, edge_atom,
+                                 atom_struct, len(types), n_struct)
+
+    def _atomic_baseline(self, types, state_atom):
+        """Per-atom energies: the per-type baseline plus, with charge_spin, the
+        state-conditioned atomic term (zero at init).
+
+        Returned per atom rather than summed so the batched paths can scatter it
+        per structure; the single-structure callers just sum it.
+        """
+        e_at = self.atomic_energy[types]
+        if self.state_energy is not None:
+            e_at = e_at + self.state_energy(types, state_atom)
+        return e_at
+
+    def _readout_energy(self, invariants, dist_ij, types, edge_i, state_atom=None):
+        """Per-edge invariants → the total energy of ONE structure (+ mixture info).
+
+        The single-head and mixture read-outs behind one call, so forward and
+        forward_pbc carry no branch of their own.
+        """
+        baseline = self._atomic_baseline(types, state_atom).sum()
+        if self.mixture_head is None:
+            return self._apply_output(invariants, dist_ij).sum() + baseline, None
+        mix_e, info = self._mixture_readout(invariants, dist_ij, types, edge_i)
+        return mix_e.sum() + baseline, info
+
 
     def _run_equivariant_layers(self, A_cos, A_sin, **kwargs):
         """Run the equivariant layers, interleaving a message-passing layer
@@ -582,6 +874,13 @@ class ECENet(nn.Module):
         # once before the layer stack (covers every forward path through here).
         if self.element_film is not None:
             A_cos, A_sin = self._apply_element_film(A_cos, A_sin, type_i, type_j, dist_ij)
+
+        # Total-charge / total-spin gate — same site, same argument, one extra
+        # invariant leg. Every forward path that can reach here passes
+        # state_edge whenever the model was built with charge_spin=True.
+        if self.state_film is not None:
+            A_cos, A_sin = self._apply_state_film(A_cos, A_sin, type_i, type_j,
+                                                  kwargs.get('state_edge'))
 
         if self.n_mp == 1:
             # Plain model: a flat list of equivariant layers, no message passing.
@@ -800,27 +1099,39 @@ class ECENet(nn.Module):
 
     # ── Forward ────────────────────────────────────────────────────────────
 
-    def _edgeless_result(self, types, device, dtype, return_embeddings, l0_only):
+    def _edgeless_result(self, types, device, dtype, return_embeddings, l0_only,
+                         return_mixture=False, state_atom=None):
         """Zero-edge result for forward / forward_pbc.
 
         Keeps the per-element constants: the with-edges paths add atomic_energy
         for every atom (edgeless ones included), and forward_batch_multi does
         the same for zero-edge structures — a bare 0 here would make the energy
-        jump by Σ atomic_energy when the last edge crosses r_cut. Embeddings
-        are zero rows (an edgeless atom scatter-sums no edge invariants).
+        jump by Σ atomic_energy when the last edge crosses r_cut. Under a
+        mixture read-out the same argument applies to the per-(type, expert)
+        constants, so the head is still evaluated, just on an empty edge set.
+        Embeddings are zero rows (an edgeless atom scatter-sums no edge
+        invariants). With charge_spin the state-conditioned atomic term rides
+        along in the baseline — it is edge-free, so an isolated ion keeps a
+        charge-dependent energy after its last neighbour has left the cutoff.
         """
-        energy = self.atomic_energy[types].sum()
+        energy = self._atomic_baseline(types, state_atom).sum()
+        info = None
+        if self.mixture_head is not None:
+            mix_e, info = self._mixture_readout(None, None, types, None)
+            energy = energy + mix_e.sum()
         if not return_embeddings:
-            return energy
+            return _with_mixture(energy, info, return_mixture)
         N = len(types)
         l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
         if l0_only:
-            return energy, l0
+            return _with_mixture((energy, l0), info, return_mixture)
         l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
-        return energy, l0, l1
+        return _with_mixture((energy, l0, l1), info, return_mixture)
 
     def forward(self, positions: torch.Tensor, types: torch.Tensor,
-                return_embeddings: bool = False, l0_only: bool = False):
+                return_embeddings: bool = False, l0_only: bool = False,
+                return_mixture: bool = False,
+                total_charge=None, total_spin=None):
         """Compute total energy, and optionally per-atom embeddings.
 
         Args:
@@ -830,6 +1141,17 @@ class ECENet(nn.Module):
                                embeddings for downstream use (e.g. long-range terms)
             l0_only:           with return_embeddings, return only the invariant l0
                                and skip the l=1 work (returns (energy, l0))
+            return_mixture:    with n_experts > 1, also return the mixture
+                               diagnostics dict (diabatic energies, couplings,
+                               expert weights per segment) as a trailing element.
+                               None for a single-head model.
+            total_charge:      total charge in e (a cation is +1). Consumed only
+                               by a ``charge_spin=True`` model; None means
+                               neutral. A state-blind model warns once if given
+                               a nonzero value rather than silently answering
+                               for the neutral system.
+            total_spin:        number of unpaired electrons (multiplicity - 1);
+                               None means closed shell.
 
         Returns:
             energy: scalar tensor              if return_embeddings is False
@@ -837,14 +1159,21 @@ class ECENet(nn.Module):
               l0: (N, 2*embed_dim)
               l1: (N, 2*embed_dim, 3)
             (energy, l0)                       if return_embeddings and l0_only
+            (..., info)                        if return_mixture
         """
         device, dtype = positions.device, positions.dtype
+
+        # One structure → one state row, broadcast to its atoms and edges.
+        state = self._state_features(total_charge, total_spin,
+                                     (len(types),), device, dtype)
+        state_atom = None if state is None else state.expand(len(types), -1)
 
         # ── Edges ─────────────────────────────────────────────────────────
         edge_i_undir, edge_j_undir = find_edges(positions, self.r_cut_edge)
         if len(edge_i_undir) == 0:
             return self._edgeless_result(types, device, dtype,
-                                         return_embeddings, l0_only)
+                                         return_embeddings, l0_only,
+                                         return_mixture, state_atom=state_atom)
 
         edge_i = torch.cat([edge_i_undir, edge_j_undir])
         edge_j = torch.cat([edge_j_undir, edge_i_undir])
@@ -876,28 +1205,31 @@ class ECENet(nn.Module):
             A_cos, A_sin,
             r_hat=r_hat, edge_i=edge_i, edge_j=edge_j,
             dist_ij=dist_ij, n_atoms=len(types),
-            type_i=ti, type_j=tj, D_block=D_block)
+            type_i=ti, type_j=tj, D_block=D_block,
+            state_edge=None if state is None else state.expand(len(edge_i), -1))
 
-        # ── Step 6+7: m=0 invariants → output_net → dot(rij_basis) ──────────
+        # ── Step 6+7: m=0 invariants → read-out ─────────────────────────────
         invariants = self._contract(A_cos, A_sin)   # (n_edges, n_features_per_m)
-        per_edge_energy = self._apply_output(invariants, dist_ij)
-        energy = per_edge_energy.sum() + self.atomic_energy[types].sum()
+        energy, info = self._readout_energy(invariants, dist_ij, types, edge_i,
+                                            state_atom=state_atom)
 
         if return_embeddings:
             l0, l1 = self._aggregate_lr_embeddings(
                 A_cos, A_sin, r_hat, edge_j, len(types), with_l1=not l0_only,
                 dist_ij=dist_ij)
             if l0_only:
-                return energy, l0
-            return energy, l0, l1
-        return energy
+                return _with_mixture((energy, l0), info, return_mixture)
+            return _with_mixture((energy, l0, l1), info, return_mixture)
+        return _with_mixture(energy, info, return_mixture)
 
     def forward_pbc(self, positions: torch.Tensor, types: torch.Tensor,
                     edge_i: torch.Tensor, edge_j: torch.Tensor,
                     shift_vecs_edge: torch.Tensor,
                     nb_src: torch.Tensor, nb_dst: torch.Tensor,
                     shift_vecs_nb: torch.Tensor,
-                    return_embeddings: bool = False, l0_only: bool = False):
+                    return_embeddings: bool = False, l0_only: bool = False,
+                    return_mixture: bool = False,
+                    total_charge=None, total_spin=None):
         """Compute total energy with periodic boundary conditions.
 
         Args:
@@ -909,16 +1241,30 @@ class ECENet(nn.Module):
             shift_vecs_nb:     (n_nb, 3) Cartesian PBC shift vectors for neighbors
             return_embeddings: if True, also return per-atom (l0, l1) embeddings
             l0_only:           with return_embeddings, skip the l=1 work
+            return_mixture:    with n_experts > 1, append the mixture
+                               diagnostics dict (see forward())
+            total_charge:      total charge in e (a cation is +1). Consumed only
+                               by a ``charge_spin=True`` model; None means
+                               neutral. A state-blind model warns once if given
+                               a nonzero value rather than silently answering
+                               for the neutral system.
+            total_spin:        number of unpaired electrons (multiplicity - 1);
+                               None means closed shell.
 
         Returns:
-            energy — or (energy, l0[, l1]) as in forward().
+            energy — or (energy, l0[, l1][, info]) as in forward().
         """
         device, dtype = positions.device, positions.dtype
         n_edges = len(edge_i)
 
+        state = self._state_features(total_charge, total_spin,
+                                     (len(types),), device, dtype)
+        state_atom = None if state is None else state.expand(len(types), -1)
+
         if n_edges == 0:
             return self._edgeless_result(types, device, dtype,
-                                         return_embeddings, l0_only)
+                                         return_embeddings, l0_only,
+                                         return_mixture, state_atom=state_atom)
 
         # ── Edges with PBC shifts ──────────────────────────────────────────
         diff_ij = (positions[edge_j] - positions[edge_i]
@@ -942,20 +1288,21 @@ class ECENet(nn.Module):
             A_cos, A_sin,
             r_hat=r_hat, edge_i=edge_i, edge_j=edge_j,
             dist_ij=dist_ij, n_atoms=len(types),
-            type_i=ti, type_j=tj, D_block=D_block)
+            type_i=ti, type_j=tj, D_block=D_block,
+            state_edge=None if state is None else state.expand(n_edges, -1))
 
         invariants = self._contract(A_cos, A_sin)
-        per_edge_energy = self._apply_output(invariants, dist_ij)
-        energy = per_edge_energy.sum() + self.atomic_energy[types].sum()
+        energy, info = self._readout_energy(invariants, dist_ij, types, edge_i,
+                                            state_atom=state_atom)
 
         if return_embeddings:
             l0, l1 = self._aggregate_lr_embeddings(
                 A_cos, A_sin, r_hat, edge_j, len(types), with_l1=not l0_only,
                 dist_ij=dist_ij)
             if l0_only:
-                return energy, l0
-            return energy, l0, l1
-        return energy
+                return _with_mixture((energy, l0), info, return_mixture)
+            return _with_mixture((energy, l0, l1), info, return_mixture)
+        return _with_mixture(energy, info, return_mixture)
 
     @torch.no_grad()
     def _local_topology(self, pos):
@@ -990,7 +1337,8 @@ class ECENet(nn.Module):
 
     def forward_batch_multi(self, positions_list, types_list,
                             return_embeddings=False, l0_only=False,
-                            topology=None):
+                            topology=None, return_mixture=False,
+                            total_charge=None, total_spin=None):
         """Batch forward for variable-size, variable-composition structures.
 
         Only topology (edge/neighbour indices) is built per-structure in a
@@ -1016,12 +1364,31 @@ class ECENet(nn.Module):
                                are allowed; skips the per-structure dist_mat
                                + nonzero syncs
 
+            return_mixture:    with n_experts > 1, append the mixture
+                               diagnostics dict (see forward()); its per-segment
+                               rows span the whole concatenated atom set, with
+                               'seg_struct' mapping them back to structures
+            total_charge:      per-structure total charge in e — a (B,) tensor /
+                               sequence, or one scalar for the whole batch. None
+                               means every structure is neutral (see forward()).
+            total_spin:        per-structure unpaired electrons, same forms.
+
         Returns:
-            energies: (B,) tensor — or (energies, l0_list[, l1_list])
+            energies: (B,) tensor — or (energies, l0_list[, l1_list][, info])
         """
         B = len(positions_list)
         device = positions_list[0].device
         dtype  = positions_list[0].dtype
+        atom_counts = torch.tensor([p.shape[0] for p in positions_list],
+                                   dtype=torch.long, device=device)
+        atom_struct = torch.repeat_interleave(
+            torch.arange(B, dtype=torch.long, device=device), atom_counts)
+        # types_all is hoisted above the zero-edge return so the state-conditioned
+        # atomic term can use it on both paths.
+        types_all = torch.cat(types_list, dim=0)            # (N_total,)
+        state = self._state_features(total_charge, total_spin, atom_counts,
+                                     device, dtype)
+        state_atom = None if state is None else state[atom_struct]
 
         edge_i_list, edge_j_list = [], []   # flat atom indices with offsets (for MP)
         nb_src_list, nb_dst_list = [], []   # flat ACE neighbour indices (offset)
@@ -1070,19 +1437,27 @@ class ECENet(nn.Module):
             atom_offset += N_b
 
         energies = torch.stack(atomic_e_list)   # (B,)
+        if self.state_energy is not None:
+            energies = energies + torch.zeros(B, dtype=dtype, device=device).index_add(
+                0, atom_struct, self.state_energy(types_all, state_atom))
 
         total_edges = sum(len(x) for x in edge_i_list)
         if total_edges == 0:
+            info = None
+            if self.mixture_head is not None:
+                mix_e, info = self._mixture_readout(
+                    None, None, types_all, None, atom_struct, B)
+                energies = energies + mix_e
             if return_embeddings:
                 n_ch = 2 * self.embed_dim
                 l0_list = [torch.zeros(p.shape[0], self._l0_dim, dtype=dtype, device=device)
                            for p in positions_list]
                 if l0_only:
-                    return energies, l0_list
+                    return _with_mixture((energies, l0_list), info, return_mixture)
                 l1_list = [torch.zeros(p.shape[0], n_ch, 3, dtype=dtype, device=device)
                            for p in positions_list]
-                return energies, l0_list, l1_list
-            return energies
+                return _with_mixture((energies, l0_list, l1_list), info, return_mixture)
+            return _with_mixture(energies, info, return_mixture)
 
         # Merge flat edge / neighbour arrays
         edge_i_flat = torch.cat(edge_i_list)
@@ -1113,7 +1488,6 @@ class ECENet(nn.Module):
         # collapsing O(#structures) ACE/embed launches to one. Atoms in
         # zero-edge structures appear in no neighbour list → zero basis, unused.
         pos_all   = torch.cat(positions_list, dim=0)        # (N_total, 3)
-        types_all = torch.cat(types_list, dim=0)            # (N_total,)
 
         A = self._compute_ace_basis(pos_all.unsqueeze(0), nb_src_flat, nb_dst_flat,
                                     types_all,
@@ -1137,13 +1511,19 @@ class ECENet(nn.Module):
             A_cos, A_sin,
             r_hat=r_hat, edge_i=edge_i_flat, edge_j=edge_j_flat,
             dist_ij=dist_ij, n_atoms=atom_offset,
-            type_i=type_i, type_j=type_j, D_block=D_block)
+            type_i=type_i, type_j=type_j, D_block=D_block,
+            state_edge=None if state is None else state_atom[edge_i_flat])
 
         invariants = self._contract(A_cos, A_sin)
-        per_edge_energy = self._apply_output(invariants, dist_ij)
-
-        energies = energies + torch.zeros(B, dtype=dtype, device=device).scatter_add(
-            0, struct_idx, per_edge_energy)
+        info = None
+        if self.mixture_head is not None:
+            mix_e, info = self._mixture_readout(invariants, dist_ij, types_all,
+                                                edge_i_flat, atom_struct, B)
+            energies = energies + mix_e
+        else:
+            per_edge_energy = self._apply_output(invariants, dist_ij)
+            energies = energies + torch.zeros(B, dtype=dtype, device=device).scatter_add(
+                0, struct_idx, per_edge_energy)
 
         if return_embeddings:
             l0_flat, l1_flat = self._aggregate_lr_embeddings(
@@ -1164,12 +1544,13 @@ class ECENet(nn.Module):
                     l1_list.append(l1_flat[offset:offset + N_b])
                 offset += N_b
             if l0_only:
-                return energies, l0_list
-            return energies, l0_list, l1_list
-        return energies
+                return _with_mixture((energies, l0_list), info, return_mixture)
+            return _with_mixture((energies, l0_list, l1_list), info, return_mixture)
+        return _with_mixture(energies, info, return_mixture)
 
     def forward_batch(self, positions_list, types, topology=None,
-                      return_embeddings=False, l0_only=False):
+                      return_embeddings=False, l0_only=False,
+                      return_mixture=False, total_charge=None, total_spin=None):
         """Compute energies for a batch of structures sharing the same atom types.
 
         Args:
@@ -1182,9 +1563,14 @@ class ECENet(nn.Module):
             return_embeddings: if True, also return per-atom (l0, l1) embeddings,
                             each as a list of B per-structure tensors
             l0_only:        with return_embeddings, skip the l=1 work
+            return_mixture: with n_experts > 1, append the mixture diagnostics
+                            dict (see forward())
+            total_charge:   per-structure total charge in e, or one scalar for
+                            the batch; None → neutral (see forward())
+            total_spin:     per-structure unpaired electrons, same forms
 
         Returns:
-            energies: (B,) tensor — or (energies, l0_list[, l1_list])
+            energies: (B,) tensor — or (energies, l0_list[, l1_list][, info])
         """
         if not isinstance(topology, dict):
             # Variable-topology fallback: forward_batch_multi subsumes this case
@@ -1205,7 +1591,8 @@ class ECENet(nn.Module):
             return self.forward_batch_multi(
                 positions_list, [types] * len(positions_list),
                 return_embeddings=return_embeddings, l0_only=l0_only,
-                topology=topology)
+                topology=topology, return_mixture=return_mixture,
+                total_charge=total_charge, total_spin=total_spin)
 
         # ── Fixed topology: vectorized over B ─────────────────────────────
         B = len(positions_list)
@@ -1218,6 +1605,15 @@ class ECENet(nn.Module):
         n_edges = edge_i.shape[0]
 
         pos_batch = torch.stack(positions_list)  # (B, N, 3)
+        # Every structure here is the same molecule, so one atom count for all;
+        # the flat atom order below is b-major (offset = b*N), which is what
+        # repeat_interleave / types.repeat(B) both produce.
+        state = self._state_features(
+            total_charge, total_spin,
+            (len(types),) * len(positions_list),
+            pos_batch.device, pos_batch.dtype)
+        state_atom = None if state is None else state.repeat_interleave(
+            pos_batch.shape[1], dim=0)                       # (B*N, 4)
 
         # ── Edges ────────────────────────────────────────────────────────
         diff_ij = pos_batch[:, edge_j] - pos_batch[:, edge_i]  # (B, n_edges, 3)
@@ -1262,13 +1658,27 @@ class ECENet(nn.Module):
             A_cos_flat, A_sin_flat,
             r_hat=r_hat_flat, edge_i=edge_i_flat, edge_j=edge_j_flat,
             dist_ij=dist_ij.reshape(B * n_edges), n_atoms=B * N,
-            type_i=type_i_flat, type_j=type_j_flat, D_block=D_block)
+            type_i=type_i_flat, type_j=type_j_flat, D_block=D_block,
+            state_edge=None if state is None else state_atom[edge_i_flat])
 
-        # ── Step 6+7: m=0 invariants → output_net → dot(rij_basis) ──────────
+        # ── Step 6+7: m=0 invariants → read-out ─────────────────────────────
         invariants = self._contract(A_cos_flat, A_sin_flat)      # (B*n_edges, n_features_per_m)
-        per_edge_energy = self._apply_output(invariants, dist_ij.reshape(B * n_edges))  # (B*n_edges,)
-        energies = per_edge_energy.reshape(B, n_edges).sum(dim=1)        # (B,)
+        dist_flat = dist_ij.reshape(B * n_edges)
+        info = None
+        if self.mixture_head is not None:
+            # One flat atom set of B copies of the same molecule; edge_i_flat
+            # already carries the b*N offsets built for the MP scatter.
+            atom_struct = torch.arange(B, device=types.device).repeat_interleave(N)
+            energies, info = self._mixture_readout(
+                invariants, dist_flat, types.repeat(B), edge_i_flat, atom_struct, B)
+        else:
+            per_edge_energy = self._apply_output(invariants, dist_flat)  # (B*n_edges,)
+            energies = per_edge_energy.reshape(B, n_edges).sum(dim=1)        # (B,)
         energies = energies + self.atomic_energy[types].sum()
+        if self.state_energy is not None:
+            # b-major flat atom set, so a (B, N) reshape sums each structure's own.
+            energies = energies + self.state_energy(
+                types.repeat(B), state_atom).reshape(B, N).sum(dim=1)
 
         if return_embeddings:
             l0_flat, l1_flat = self._aggregate_lr_embeddings(
@@ -1276,10 +1686,10 @@ class ECENet(nn.Module):
                 with_l1=not l0_only, dist_ij=dist_ij.reshape(B * n_edges))
             l0_list = [l0_flat[b * N:(b + 1) * N] for b in range(B)]
             if l0_only:
-                return energies, l0_list
+                return _with_mixture((energies, l0_list), info, return_mixture)
             l1_list = [l1_flat[b * N:(b + 1) * N] for b in range(B)]
-            return energies, l0_list, l1_list
-        return energies
+            return _with_mixture((energies, l0_list, l1_list), info, return_mixture)
+        return _with_mixture(energies, info, return_mixture)
 
 
 # ---------------------------------------------------------------------------

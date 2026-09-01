@@ -46,6 +46,13 @@ class ECENetCalculator(Calculator):
         Optional per-element reference energies {symbol: eV} to add back
         to the model's residual energy (needed if model was trained on
         residual energies).  Keys are element symbols, values are eV/atom.
+    charge, spin : float or None
+        Fixed electronic state for every structure this calculator sees,
+        overriding whatever the Atoms object carries — for driving MD on an
+        ion whose trajectory frames say nothing about their charge. ``None``
+        (default) reads the state off each Atoms object; see ``_read_state``.
+        Consumed only by a model built with ``charge_spin=True``, which warns
+        once if handed a state it cannot use.
     """
 
     implemented_properties = ['energy', 'forces', 'stress']
@@ -58,7 +65,7 @@ class ECENetCalculator(Calculator):
     def __init__(self, model, device=None, dtype=torch.float64,
                  energy_reference=None, element_to_type=None,
                  energy_units='eV', energy_mean=0.0,
-                 log_timings=False, **kwargs):
+                 log_timings=False, charge=None, spin=None, **kwargs):
         super().__init__(**kwargs)
         self.model = model
         self.model.eval()
@@ -79,6 +86,16 @@ class ECENetCalculator(Calculator):
             self._to_ev = 1.0
         # training mean energy (already in model units) converted to eV
         self._energy_mean_ev = energy_mean * self._to_ev
+        # Electronic state: a fixed override, or None to read each Atoms object.
+        self.charge = charge
+        self.spin = spin
+        # The state of the structure currently being evaluated, as model kwargs.
+        # calculate() refreshes it before building the graph; the energy seams
+        # read it, the way they already write self.results. Keeping it off their
+        # signatures leaves _compute_stress / _compute_pbc / the LES overrides
+        # untouched — the state is a property of the structure, not of the
+        # strain pass or the neighbour list.
+        self._state = {'total_charge': 0.0, 'total_spin': 0.0}
 
     # ── Construction helpers ────────────────────────────────────────────────
 
@@ -86,7 +103,7 @@ class ECENetCalculator(Calculator):
     def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
                         energy_reference=None, element_to_type=None,
                         energy_units=None, log_timings=False,
-                        ignore_les=False, ckpt=None):
+                        ignore_les=False, ckpt=None, charge=None, spin=None):
         """Load model and hparams directly from a checkpoint file.
 
         The checkpoint is expected to be self-describing: the training scripts
@@ -112,6 +129,9 @@ class ECENetCalculator(Calculator):
         energy_units : str, optional
             'eV' or 'kcal/mol'. If None, read from the checkpoint's
             'energy_units' key, defaulting to 'eV'.
+        charge, spin : float, optional
+            Fixed electronic state for every structure, overriding what the
+            Atoms objects carry (see the class docstring).
         """
         from ecenet import ECENet
 
@@ -251,7 +271,8 @@ class ECENetCalculator(Calculator):
                    element_to_type=element_to_type,
                    energy_units=energy_units,
                    energy_mean=energy_mean,
-                   log_timings=log_timings)
+                   log_timings=log_timings,
+                   charge=charge, spin=spin)
 
     # ── GPU neighbor list ───────────────────────────────────────────────────
 
@@ -308,7 +329,7 @@ class ECENetCalculator(Calculator):
 
     def _energy_free(self, pos, types):
         """Total energy of a non-periodic system (model units)."""
-        return self.model.forward(pos, types)
+        return self.model.forward(pos, types, **self._state)
 
     def _energy_pbc(self, pos, types, edge_i, edge_j, shift_vecs_edge,
                     nb_src, nb_dst, shift_vecs_nb, cell=None):
@@ -320,7 +341,7 @@ class ECENetCalculator(Calculator):
         """
         return self.model.forward_pbc(
             pos, types, edge_i, edge_j, shift_vecs_edge,
-            nb_src, nb_dst, shift_vecs_nb)
+            nb_src, nb_dst, shift_vecs_nb, **self._state)
 
     def _compute_stress(self, pos, types, edge_i, edge_j, shift_vecs_edge,
                         nb_src, nb_dst, shift_vecs_nb, cell_np): # Prototype, mainly implemented by Claude
@@ -368,6 +389,71 @@ class ECENetCalculator(Calculator):
         return torch.tensor(
             [self.element_to_type[s] for s in symbols],
             dtype=torch.long, device=self.device)
+
+    def _read_state(self, atoms):
+        """Total charge (e) and total spin (unpaired electrons) of ``atoms``.
+
+        Precedence, most explicit first:
+
+        1. the calculator's own ``charge`` / ``spin`` overrides;
+        2. ``atoms.info``: ``'charge'`` / ``'total_charge'``, and ``'spin'`` /
+           ``'total_spin'`` (unpaired electrons) or ``'multiplicity'`` /
+           ``'spin_multiplicity'`` (converted, ``S = multiplicity - 1``) — the
+           keys extended-XYZ round-trips, so a frame read from disk keeps its
+           state;
+        3. the per-atom arrays ASE always has: ``get_initial_charges().sum()``
+           and ``|get_initial_magnetic_moments().sum()|``, both zero on a plain
+           Atoms object, which is the neutral closed-shell default.
+
+        Returns the kwargs the model's forward paths take, so callers splat it.
+        """
+        info = getattr(atoms, 'info', {}) or {}
+
+        q = self.charge
+        if q is None:
+            for key in ('charge', 'total_charge'):
+                if key in info:
+                    q = info[key]
+                    break
+        if q is None:
+            q = float(np.sum(atoms.get_initial_charges()))
+
+        s = self.spin
+        if s is None:
+            for key in ('spin', 'total_spin'):
+                if key in info:
+                    s = info[key]
+                    break
+        if s is None:
+            for key in ('multiplicity', 'spin_multiplicity'):
+                if key in info:
+                    s = float(info[key]) - 1.0
+                    break
+        if s is None:
+            # |Σ m_i|: ASE's initial magnetic moments are per-atom spin
+            # densities, whose sum is the net unpaired-electron count.
+            s = abs(float(np.sum(atoms.get_initial_magnetic_moments())))
+
+        return {'total_charge': float(q), 'total_spin': float(s)}
+
+    def check_state(self, atoms, tol=1e-15):
+        """ASE's cache invalidation, extended with the electronic state.
+
+        ``Calculator.check_state`` compares positions, numbers, cell, pbc and
+        the per-atom initial charges/magmoms — but **not** ``atoms.info``. Two
+        structures differing only in ``atoms.info['charge']`` therefore look
+        identical to it, and the second would be served the first's cached
+        energy. Comparing the state too is what makes
+
+            atoms.info['charge'] = 1; atoms.get_potential_energy()
+
+        mean what it says on a calculator that has already seen the neutral
+        geometry.
+        """
+        changes = super().check_state(atoms, tol=tol)
+        if self._read_state(atoms) != self._state:
+            changes = changes + ['electronic_state']
+        return changes
 
     def _neighbor_lists(self, pos, cell):
         """Edge + neighbour lists for a periodic cell.
@@ -435,6 +521,7 @@ class ECENetCalculator(Calculator):
         symbols = atoms.get_chemical_symbols()
         positions_np = atoms.get_positions()  # Å
         types = self._types(symbols)
+        self._state = self._read_state(atoms)
         pos = torch.tensor(
             positions_np, dtype=self.dtype, device=self.device
         ).requires_grad_(True)
@@ -528,7 +615,8 @@ class ECENetLESCalculator(ECENetCalculator):
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
                         energy_reference=None, element_to_type=None,
-                        energy_units=None, log_timings=False, ckpt=None):
+                        energy_units=None, log_timings=False, ckpt=None,
+                        charge=None, spin=None):
         """Load model + LES module from a joint checkpoint (see base class)."""
         if ckpt is None:
             ckpt = torch.load(checkpoint_path, map_location='cpu',
@@ -542,7 +630,7 @@ class ECENetLESCalculator(ECENetCalculator):
             checkpoint_path, device=device, dtype=dtype,
             energy_reference=energy_reference, element_to_type=element_to_type,
             energy_units=energy_units, log_timings=log_timings,
-            ignore_les=True, ckpt=ckpt)
+            ignore_les=True, ckpt=ckpt, charge=charge, spin=spin)
 
         from ecenet.les import load_les_module
         calc.les_module = load_les_module(ckpt['les'], calc.model,
@@ -568,7 +656,7 @@ class ECENetLESCalculator(ECENetCalculator):
 
     def _energy_free(self, pos, types):
         e_sr, l0 = self.model.forward(pos, types, return_embeddings=True,
-                                      l0_only=True)
+                                      l0_only=True, **self._state)
         e_lr, q = self.les_module(l0, pos, return_charges=True,
                                   **self.les_flags)
         self._stash_charges(q, l0)
@@ -579,7 +667,7 @@ class ECENetLESCalculator(ECENetCalculator):
         e_sr, l0 = self.model.forward_pbc(
             pos, types, edge_i, edge_j, shift_vecs_edge,
             nb_src, nb_dst, shift_vecs_nb,
-            return_embeddings=True, l0_only=True)
+            return_embeddings=True, l0_only=True, **self._state)
         e_lr, q = self.les_module(l0, pos, cell=cell, return_charges=True,
                                   **self.les_flags)
         self._stash_charges(q, l0)
@@ -607,6 +695,7 @@ class ECENetLESCalculator(ECENetCalculator):
         """
         symbols = atoms.get_chemical_symbols()
         types = self._types(symbols)
+        state = self._read_state(atoms)
         pos = torch.tensor(atoms.get_positions(), dtype=self.dtype,
                            device=self.device).requires_grad_(True)
         with torch.enable_grad():
@@ -616,12 +705,12 @@ class ECENetLESCalculator(ECENetCalculator):
                  nb_src, nb_dst, shn) = self._neighbor_lists(pos, cell_np)
                 _, l0 = self.model.forward_pbc(
                     pos, types, edge_i, edge_j, she, nb_src, nb_dst, shn,
-                    return_embeddings=True, l0_only=True)
+                    return_embeddings=True, l0_only=True, **state)
                 cell_t = torch.tensor(cell_np, dtype=self.dtype,
                                       device=self.device).view(-1, 3, 3)
             else:
                 _, l0 = self.model.forward(pos, types, return_embeddings=True,
-                                           l0_only=True)
+                                           l0_only=True, **state)
                 cell_t = None
             if self.les_flags['l0_is_charge']:
                 q = l0[:, 0]

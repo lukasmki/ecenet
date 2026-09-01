@@ -4,6 +4,10 @@ A small MLP on ``concat[embed(type_i), embed(type_j), φ(r_ij)]`` produces a
 per-feature FiLM modulation: a scale ``γ`` and (optionally) a shift ``β``,
 applied downstream as ``γ ⊙ x + β``.
 
+``n_extra`` swaps in (or adds) any other *invariant* conditioning leg in place
+of the radial one — ECENet uses that to run a second instance of this gate on
+the total-charge / total-spin state vector (``ecenet/electronic.py``).
+
 Adapted from the template-mix 'mlp' coefficient gate (the old ElementCoeff):
 the *generator* is identical — per-element embedding tables ``a[z_i]`` / ``b[z_j]``
 concatenated with a radial basis of the bond distance, fed to a SiLU MLP — but
@@ -23,6 +27,14 @@ class ElementFiLM(nn.Module):
         n_types:    number of element types
         embed_dim:  width P of each element embedding (default 16)
         n_rbf:      size of the radial basis φ(r) leg (0 → element-only gate)
+        n_extra:    width of an additional *invariant* conditioning leg, appended
+                    to the MLP input and supplied per edge as ``extra`` (0 → no
+                    such leg). Used for the total-charge / total-spin state
+                    vector (``ecenet/electronic.py``). Only invariant features
+                    are legal here — the equivariance note below rests on γ and β
+                    being scalars that do not transform under the bond frame's
+                    residual SO(2), which holds for any conditioning input that
+                    is itself invariant.
         hidden:     gate-MLP hidden width(s): int, list/tuple, or None
                     (→ ``[max(2*n_features, 32)]``)
         shift:      if True predict a shift β too (full FiLM), as an extra head on
@@ -49,7 +61,7 @@ class ElementFiLM(nn.Module):
                     (m > l of that channel), which can carry rotation-inconsistent
                     values that a per-mode scale must not touch differentially.
 
-    forward(type_i, type_j, r_basis=None) → (gamma, beta)
+    forward(type_i, type_j, r_basis=None, extra=None) → (gamma, beta)
         gamma: (E, n_features) or (E, n_features, M)  = base + Δ  (= base at init)
         beta:  (E, n_features), the m=0 shift        = 0 at init (None when shift=False)
 
@@ -67,15 +79,17 @@ class ElementFiLM(nn.Module):
     """
 
     def __init__(self, n_features, n_types, embed_dim=16, n_rbf=0,
-                 hidden=None, shift=True, base=1.0, n_modes=1, mode_valid=None):
+                 hidden=None, shift=True, base=1.0, n_modes=1, mode_valid=None,
+                 n_extra=0):
         super().__init__()
         self.n_features = int(n_features)
         self.n_rbf = int(n_rbf or 0)
+        self.n_extra = int(n_extra or 0)
         self.n_modes = max(1, int(n_modes))
         self.shift = shift
         self.base = float(base)
         P = int(embed_dim)
-        in_dim = 2 * P + self.n_rbf
+        in_dim = 2 * P + self.n_rbf + self.n_extra
         # One scale per (channel, mode) — n_modes == 1 → per channel — plus, when
         # shift=True, an extra head of n_features for the m=0 shift. Both come out
         # of the same MLP: the last layer is just wider.
@@ -122,13 +136,20 @@ class ElementFiLM(nn.Module):
             x = x * self.mode_valid
         return x
 
-    def forward(self, type_i, type_j, r_basis=None):
+    def forward(self, type_i, type_j, r_basis=None, extra=None):
         feats = [self.a(type_i), self.b(type_j)]          # (E, P) each
         if self.n_rbf:
             if r_basis is None:
                 raise ValueError("ElementFiLM built with a radial leg (n_rbf>0) "
                                  "needs r_basis of shape (E, n_rbf).")
             feats.append(r_basis)
+        if self.n_extra:
+            if extra is None or extra.shape[-1] != self.n_extra:
+                raise ValueError(
+                    f"ElementFiLM built with an extra leg (n_extra="
+                    f"{self.n_extra}) needs extra of shape (E, {self.n_extra}), "
+                    f"got {None if extra is None else tuple(extra.shape)}.")
+            feats.append(extra.to(feats[0].dtype))
         out = self.mlp(torch.cat(feats, dim=-1))          # (E, out_dim)
         if self.shift:
             # [ scale | m=0 shift ] — beta is (E, n_features), never per-mode, and
